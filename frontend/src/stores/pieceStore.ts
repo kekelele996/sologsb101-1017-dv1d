@@ -19,6 +19,7 @@ import {
   removeStep,
   reorderSteps,
   syncPieceState,
+  voidAnnealsForPiece,
 } from '../utils/db'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
 import { nowIso, uuid } from '../utils/id'
@@ -170,6 +171,8 @@ export const usePieceStore = defineStore('piece', () => {
   async function updatePiece(pieceId: string, draft: PieceDraft): Promise<void> {
     const existing = pieces.value.find((row) => row.id === pieceId)
     if (existing === undefined) return
+    // 壁厚是退火时间窗的依据：排位后再改动，已排的退火记录即作废，等排产员按新壁厚重排
+    const thicknessChanged = Math.abs(existing.wallThicknessMm - draft.wallThicknessMm) > 0.0001
     await putPiece({
       ...existing,
       name: draft.name.trim() || existing.name,
@@ -181,6 +184,15 @@ export const usePieceStore = defineStore('piece', () => {
       state: draft.state,
     })
     revision.value += 1
+    if (thicknessChanged) {
+      const voided = await voidAnnealsForPiece(pieceId, draft.wallThicknessMm)
+      lastMessage.value =
+        voided > 0
+          ? `作品信息已更新；壁厚改动已作废 ${voided} 条在排退火记录，请按新壁厚重排（吹制工序记录保留不变）`
+          : '作品信息已更新'
+    } else {
+      lastMessage.value = '作品信息已更新'
+    }
   }
 
   async function deletePiece(pieceId: string): Promise<void> {

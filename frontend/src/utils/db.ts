@@ -11,6 +11,7 @@ import type { GlassBatch } from '../types/batch'
 import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
+import { OCCUPYING_ANNEAL_STATES } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
@@ -19,7 +20,7 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
 export const ROW_REVISION = 2
@@ -93,6 +94,27 @@ class GlassBlowDatabase extends Dexie {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
         })
       })
+
+      // ---------- v3：退火记录补「排位依据壁厚」快照与作废/挂起原因 ----------
+      this.version(3)
+        .stores({
+          // 仅新增字段，索引不变；basisWallThicknessMm 参与窗口判重
+          anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg, basisWallThicknessMm',
+        })
+        .upgrade(async (tx) => {
+          // 读取各作品当前壁厚，作为历史退火记录的排位依据（旧数据无快照，按当前壁厚兜底）
+          const pieceRows = (await tx.table('pieces').toArray()) as Array<Record<string, unknown>>
+          const thicknessOf = new Map<string, number>()
+          pieceRows.forEach((row) => {
+            if (typeof row.wallThicknessMm === 'number') thicknessOf.set(row.id as string, row.wallThicknessMm)
+          })
+          await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
+            if (typeof row.basisWallThicknessMm !== 'number' || row.basisWallThicknessMm <= 0) {
+              row.basisWallThicknessMm = thicknessOf.get(row.pieceId as string) ?? 4
+            }
+            if (typeof row.voidReason !== 'string') row.voidReason = ''
+          })
+        })
   }
 }
 
@@ -271,6 +293,30 @@ export async function advanceAnnealState(annealId: string, next: Anneal['state']
   await syncPieceState(row.pieceId)
 }
 
+/**
+ * 作品壁厚在排位后发生改动：把该作品「在排」（待入窑 / 退火中）且依据壁厚已过期的
+ * 退火记录置为「已作废」。记录保留不删，等排产员按新壁厚重排；其余作品的退火记录不受影响。
+ * 已出炉 / 已作废 / 已挂起 的记录不动。返回作废条数。
+ */
+export async function voidAnnealsForPiece(pieceId: string, newThicknessMm: number): Promise<number> {
+  let count = 0
+  await db.transaction('rw', db.anneals, async () => {
+    const rows = await db.anneals.where('pieceId').equals(pieceId).toArray()
+    for (const row of rows) {
+      if (!(OCCUPYING_ANNEAL_STATES as Anneal['state'][]).includes(row.state)) continue
+      const basis = row.basisWallThicknessMm > 0 ? row.basisWallThicknessMm : newThicknessMm
+      if (Math.abs(basis - newThicknessMm) < 0.0001) continue
+      await db.anneals.update(row.id, {
+        state: '已作废',
+        voidReason: `壁厚由 ${basis} mm 改为 ${newThicknessMm} mm，时间窗依据失效，待按新壁厚重排。`,
+        updatedAt: nowIso(),
+      })
+      count += 1
+    }
+  })
+  return count
+}
+
 /* ------------------------------ 出炉检验 ------------------------------ */
 
 export async function listInspects(): Promise<Inspect[]> {
@@ -335,7 +381,22 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
+    // 旧存档（v2 及以前）的退火记录没有排位依据壁厚，导入时按作品当前壁厚兜底，避免显示 undefined
+    const thicknessOf = new Map<string, number>()
+    snapshot.pieces.forEach((row) => {
+      if (typeof row.wallThicknessMm === 'number') thicknessOf.set(row.id, row.wallThicknessMm)
+    })
+    await db.anneals.bulkPut(
+      snapshot.anneals.map((row) => ({
+        ...row,
+        revision: ROW_REVISION,
+        basisWallThicknessMm:
+          typeof row.basisWallThicknessMm === 'number' && row.basisWallThicknessMm > 0
+            ? row.basisWallThicknessMm
+            : (thicknessOf.get(row.pieceId) ?? 4),
+        voidReason: typeof row.voidReason === 'string' ? row.voidReason : '',
+      })),
+    )
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })
 }

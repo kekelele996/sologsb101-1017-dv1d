@@ -5,7 +5,8 @@
  * - 温度单位换算（℃ ↔ ℉）
  * - 工艺温度区间与设计尺寸校验
  */
-import type { Anneal, CurveSeg } from '../types/anneal'
+import type { Anneal, AnnealState, CurveSeg } from '../types/anneal'
+import { OCCUPYING_ANNEAL_STATES } from '../types/anneal'
 import type { Craft } from '../types/piece'
 
 /** 保留 1 位小数 */
@@ -116,6 +117,19 @@ export function annealWindow(row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg'>, w
   return [start, start + segmentHours(row.curveSeg, wallThicknessMm) * 3600 * 1000]
 }
 
+/**
+ * 退火记录的排位依据壁厚：优先用记录上快照的 `basisWallThicknessMm`，
+ * 缺失（旧数据 / 导入存档）时回退到作品当前壁厚。时间窗一律按依据壁厚计算，
+ * 这样排产员调好的窑位不会因为操作工事后改壁厚而被悄悄推翻。
+ */
+export function annealBasisThickness(
+  row: Pick<Anneal, 'basisWallThicknessMm'>,
+  liveThicknessMm: number,
+): number {
+  const basis = row.basisWallThicknessMm
+  return typeof basis === 'number' && basis > 0 ? basis : liveThicknessMm
+}
+
 /** 两个时间窗是否重叠 */
 export function windowsOverlap(a: [number, number], b: [number, number]): boolean {
   if (Number.isNaN(a[0]) || Number.isNaN(b[0])) return false
@@ -132,21 +146,25 @@ export interface SlotConflict {
 
 /**
  * 窑位占用判重：同一窑位、时间窗重叠即为冲突。
- * excludeAnnealId 用于编辑场景排除自身。
+ * - 时间窗一律按各记录的「排位依据壁厚」（basisWallThicknessMm）计算，而非作品当前壁厚；
+ * - 已作废 / 已挂起 / 已出炉 的记录不占位，不参与判重（重排撞窗只挂起，绝不改动已占记录）；
+ * - excludeAnnealId 用于编辑 / 重排场景排除自身。
  */
 export function checkSlotConflict(
   existing: Anneal[],
-  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
-  wallThicknessOf: (pieceId: string) => number,
+  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId' | 'basisWallThicknessMm'>,
+  liveThicknessOf: (pieceId: string) => number,
   excludeAnnealId = '',
 ): SlotConflict {
-  const ownThickness = wallThicknessOf(candidate.pieceId)
+  const ownThickness = annealBasisThickness(candidate, liveThicknessOf(candidate.pieceId))
   const ownWindow = annealWindow(candidate, ownThickness)
 
   for (const row of existing) {
     if (row.id === excludeAnnealId) continue
+    if (!(OCCUPYING_ANNEAL_STATES as AnnealState[]).includes(row.state)) continue
     if (row.kilnSlot !== candidate.kilnSlot) continue
-    const otherWindow = annealWindow(row, wallThicknessOf(row.pieceId))
+    const otherThickness = annealBasisThickness(row, liveThicknessOf(row.pieceId))
+    const otherWindow = annealWindow(row, otherThickness)
     if (windowsOverlap(ownWindow, otherWindow)) {
       return {
         conflict: true,

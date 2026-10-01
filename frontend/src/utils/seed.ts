@@ -27,6 +27,7 @@ export const SEED_IDS = {
   piecePaperweight: 'piece-sunset-weight',
   pieceBottle: 'piece-frost-bottle',
   pieceCup: 'piece-red-cup',
+  pieceInkstone: 'piece-inkstone',
 } as const
 
 function wrap<T>(row: Omit<T, 'createdAt' | 'updatedAt' | 'revision'>): T {
@@ -56,9 +57,10 @@ export async function seedDatabase(): Promise<void> {
   const pieces: Piece[] = [
     wrap<Piece>({ id: SEED_IDS.pieceMorning, name: '晨雾花器', batchId: SEED_IDS.batchAmber, designHeightMm: 260, wallThicknessMm: 4.5, craft: '吹制', artist: '林曦', state: '制作中' }),
     wrap<Piece>({ id: SEED_IDS.pieceGreen, name: '叠翠碗', batchId: SEED_IDS.batchCopper, designHeightMm: 180, wallThicknessMm: 6, craft: '铸造', artist: '沈沐', state: '已检验' }),
-    wrap<Piece>({ id: SEED_IDS.piecePaperweight, name: '流霞镇纸', batchId: SEED_IDS.batchIron, designHeightMm: 120, wallThicknessMm: 8, craft: '热塑', artist: '郑野', state: '制作中' }),
+    wrap<Piece>({ id: SEED_IDS.piecePaperweight, name: '流霞镇纸', batchId: SEED_IDS.batchIron, designHeightMm: 120, wallThicknessMm: 9.5, craft: '热塑', artist: '郑野', state: '制作中' }),
     wrap<Piece>({ id: SEED_IDS.pieceBottle, name: '霜白长颈瓶', batchId: SEED_IDS.batchClear, designHeightMm: 340, wallThicknessMm: 3.2, craft: '吹制', artist: '林曦', state: '已检验' }),
     wrap<Piece>({ id: SEED_IDS.pieceCup, name: '赤霞杯', batchId: SEED_IDS.batchAmber, designHeightMm: 95, wallThicknessMm: 3.5, craft: '吹制', artist: '沈沐', state: '已退火' }),
+    wrap<Piece>({ id: SEED_IDS.pieceInkstone, name: '墨韵砚台', batchId: SEED_IDS.batchIron, designHeightMm: 130, wallThicknessMm: 5.5, craft: '铸造', artist: '郑野', state: '制作中' }),
   ]
 
   // ---------------- 吹制工序（每件 2–5 道，seq 连续） ----------------
@@ -71,7 +73,8 @@ export async function seedDatabase(): Promise<void> {
     wrap<Step>({ id: 'step-g2', pieceId: SEED_IDS.pieceGreen, seq: 2, name: '开模', tempC: 940, durationMin: 12, operator: '沈沐', remark: '石膏模浇注', state: '已完成' }),
     wrap<Step>({ id: 'step-g3', pieceId: SEED_IDS.pieceGreen, seq: 3, name: '塑形', tempC: 900, durationMin: 9, operator: '郑野', remark: '修整碗口与底足', state: '已完成' }),
     wrap<Step>({ id: 'step-p1', pieceId: SEED_IDS.piecePaperweight, seq: 1, name: '取料', tempC: 1160, durationMin: 2.5, operator: '郑野', remark: '取 A-207 料液约 3.1 kg', state: '已完成' }),
-    wrap<Step>({ id: 'step-p2', pieceId: SEED_IDS.piecePaperweight, seq: 2, name: '塑形', tempC: 1020, durationMin: 7, operator: '郑野', remark: '压制成型后回火', state: '进行中' }),
+    wrap<Step>({ id: 'step-p2', pieceId: SEED_IDS.piecePaperweight, seq: 2, name: '塑形', tempC: 1020, durationMin: 7, operator: '郑野', remark: '压制成型后回火', state: '已完成' }),
+    wrap<Step>({ id: 'step-p3', pieceId: SEED_IDS.piecePaperweight, seq: 3, name: '收口', tempC: 880, durationMin: 4.5, operator: '郑野', remark: '口沿回火整平', state: '已完成' }),
     wrap<Step>({ id: 'step-b1', pieceId: SEED_IDS.pieceBottle, seq: 1, name: '取料', tempC: 1170, durationMin: 3, operator: '林曦', remark: '取 T-045 料液约 7.8 kg', state: '已完成' }),
     wrap<Step>({ id: 'step-b2', pieceId: SEED_IDS.pieceBottle, seq: 2, name: '吹制', tempC: 1110, durationMin: 7.5, operator: '林曦', remark: '长颈一次吹成', state: '已完成' }),
     wrap<Step>({ id: 'step-b3', pieceId: SEED_IDS.pieceBottle, seq: 3, name: '塑形', tempC: 990, durationMin: 10, operator: '沈沐', remark: '拉长颈部至 340 mm', state: '已完成' }),
@@ -80,14 +83,21 @@ export async function seedDatabase(): Promise<void> {
     wrap<Step>({ id: 'step-c1', pieceId: SEED_IDS.pieceCup, seq: 1, name: '取料', tempC: 1180, durationMin: 3, operator: '沈沐', remark: '取 G-101 料液约 2.4 kg', state: '已完成' }),
     wrap<Step>({ id: 'step-c2', pieceId: SEED_IDS.pieceCup, seq: 2, name: '吹制', tempC: 1130, durationMin: 5.5, operator: '沈沐', remark: '杯身一次成型', state: '已完成' }),
     wrap<Step>({ id: 'step-c3', pieceId: SEED_IDS.pieceCup, seq: 3, name: '塑形', tempC: 1000, durationMin: 8, operator: '林曦', remark: '接杯柄并回火', state: '已完成' }),
+    wrap<Step>({ id: 'step-i1', pieceId: SEED_IDS.pieceInkstone, seq: 1, name: '取料', tempC: 1130, durationMin: 4, operator: '郑野', remark: '取 A-207 料液约 5.2 kg', state: '已完成' }),
+    wrap<Step>({ id: 'step-i2', pieceId: SEED_IDS.pieceInkstone, seq: 2, name: '开模', tempC: 960, durationMin: 11, operator: '郑野', remark: '石膏模浇注砚台坯', state: '已完成' }),
+    wrap<Step>({ id: 'step-i3', pieceId: SEED_IDS.pieceInkstone, seq: 3, name: '塑形', tempC: 910, durationMin: 9.5, operator: '郑野', remark: '修整砚堂与池沿', state: '已完成' }),
   ]
 
-  // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑） ----------------
+  // ---------------- 退火（6 条：含已出炉 / 退火中 / 待入窑 / 已作废 / 已挂起） ----------------
   const anneals: Anneal[] = [
-    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中' }),
-    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑' }),
+    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉', basisWallThicknessMm: 6, voidReason: '' }),
+    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉', basisWallThicknessMm: 3.2, voidReason: '' }),
+    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中', basisWallThicknessMm: 3.5, voidReason: '' }),
+    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑', basisWallThicknessMm: 4.5, voidReason: '' }),
+    // 作废：排位后壁厚由 8 mm 改为 9.5 mm，时间窗依据失效，待按新壁厚重排（记录保留不删）
+    wrap<Anneal>({ id: 'anneal-p1', pieceId: SEED_IDS.piecePaperweight, kilnSlot: 'AN-01-B2', curveSeg: '保温', inAt: '2026-09-28T15:00', outAt: '', state: '已作废', basisWallThicknessMm: 8, voidReason: '壁厚由 8 mm 改为 9.5 mm，时间窗依据失效，待按新壁厚重排。' }),
+    // 挂起：重排撞了 anneal-m1 的时间窗，等人调整窑位/时间，绝不改动已占记录
+    wrap<Anneal>({ id: 'anneal-i1', pieceId: SEED_IDS.pieceInkstone, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:30', outAt: '', state: '已挂起', basisWallThicknessMm: 5.5, voidReason: '窑位 AN-01-B1 在该时间窗内已被占用（2026-10-02T10:00 起的 保温 段），请更换窑位或调整时间。' }),
   ]
 
   // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------

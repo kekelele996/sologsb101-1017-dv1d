@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值，`v3` 为 Anneal 增加依据壁厚与作废/挂起原因 |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -87,7 +87,7 @@ sologsb101-1017/
 | `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
 | `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
-| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
+| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态；**排位依据壁厚快照、壁厚改动自动作废、作废/挂起记录重排重试** |
 | `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
 
 `/` 重定向到 `/furnaces`，未匹配路径统一回落到 `/furnaces`。
@@ -100,13 +100,16 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**为 `Anneal` 增加 `basisWallThicknessMm`（排位依据壁厚）与 `voidReason`（作废/挂起原因）字段**：
+    * 迁移时按作品当前壁厚回填历史退火记录的依据壁厚（旧数据无快照，按当前壁厚兜底）；
+    * 时间窗改按依据壁厚计算，排产员调好的窑位不再因操作工事后改壁厚而被悄悄推翻。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,17 +118,17 @@ sologsb101-1017/
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
-  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
+  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg, **basisWallThicknessMm** |
   | `inspects` | id | pieceId, date, result, inspector |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **窑炉 → 料液批次 → 作品 → 吹制工序 → 退火 → 出炉检验** 三层互相引用：
   * 3 台窑炉（KILN-01 熔化炉 / KILN-02 坩埚炉 / AN-01 退火窑）；
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
-  * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
-  * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
+  * 6 件作品（覆盖四种状态与三种工艺）、20 道吹制工序（每件 2–5 道，seq 连续）；
+  * 6 条退火记录（窑位 A1/A2/A3/B1/B2，覆盖已出炉 / 退火中 / 待入窑 / **已作废**（流霞镇纸壁厚 8→9.5 mm）/ **已挂起**（墨韵砚台撞 B1 时间窗））；
   * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
-  * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
+  * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle`、`piece-inkstone` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的作品 id」这一界面偏好，不存业务数据。
 * 删除窑炉会级联清理其料液批次；删除作品会级联清理其工序、退火与检验记录（均在同一 Dexie 事务内完成）。
 
@@ -158,6 +161,16 @@ npm run preview      # 预览 dist 产物
   三段合计即该作品的**理论退火时长**，壁厚直接决定总时长。
 * **窑位占用判重**：同一窑位的时间窗 `[入窑, 出炉]` 重叠即判定冲突；未出炉时以「入窑 + 该曲线段理论时长」作为临时出炉时间参与判重。
   **冲突时提交按钮禁用**并给出冲突的既有记录说明。
+* **各自持有状态**：操作工在 `/pieces/:id/steps` 管吹制工序的温度、时长、操作人与推进；排产员在 `/annealing` 管窑位、曲线段与入窑出炉时间。
+  两边各写各的表，互不覆盖；作品壁厚是唯一的共享依据，通过「依据壁厚」快照解耦。
+* **依据壁厚快照**：排位（新建退火记录）时把作品当前壁厚快照为 `basisWallThicknessMm`，时间窗一律按它计算，
+  不随后续壁厚变动而悄悄改变；页面在作品列展示「排位依据壁厚 X mm」。
+* **壁厚改动即作废**：在作品页改动壁厚并保存后，该作品「在排」（待入窑 / 退火中）且依据已过期的退火记录会被置为「已作废」，
+  **记录保留不删**，等排产员按新壁厚重排；其余作品的退火记录不受影响。已出炉 / 已作废 / 已挂起 的记录不动。
+* **重排与挂起**：作废 / 挂起记录可从排产这侧重排（更新同一条记录，**不新建、不重复占位**，冲突排除自身与其他不占位记录）；
+  重排撞了时间窗则置「已挂起」等人调整窑位/时间，**绝不改动已占记录**；操作工的工序记录与作废的退火记录都保留。
+  挂起记录可改窑位/时间后「重试排产」，通过即恢复为「待入窑」。
+* **不重复占位**：同一件作品已有在排（待入窑 / 退火中）退火记录时，新建会被拒绝并提示去编辑或重排既有记录。
 * **温度单位换算**：℃ ↔ ℉（`cToF` / `fToC`）。
 * **工序温度校验**：不得超过所选窑炉的 `maxTempC`，且应落在工艺适宜区间（吹制 900–1200 ℃ / 铸造 800–1150 ℃ / 热塑 700–1000 ℃）附近。
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。

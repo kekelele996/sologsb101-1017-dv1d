@@ -13,7 +13,16 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useAnnealStore } from '@/stores/annealStore'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
-import { ANNEAL_STATE_OPTIONS, CURVE_SEG_OPTIONS, type Anneal, type AnnealDraft, type AnnealState, type CurveSeg } from '@/types/anneal'
+import {
+  ANNEAL_STATE_FLOW,
+  ANNEAL_STATE_OPTIONS,
+  CURVE_SEG_OPTIONS,
+  annealOccupies,
+  type Anneal,
+  type AnnealDraft,
+  type AnnealState,
+  type CurveSeg,
+} from '@/types/anneal'
 import { ANNEAL_CURVE, formatHours, segmentHours, totalAnnealHours } from '@/utils/thermal'
 import { nowLocalInput } from '@/utils/id'
 
@@ -60,6 +69,16 @@ const slotOptions = computed<string[]>(() => {
   return list
 })
 
+/** 当前正在编辑的退火记录（用于判断作废 / 挂起重试场景） */
+const editingRow = computed<Anneal | null>(() => annealStore.anneals.find((row) => row.id === editingId.value) ?? null)
+const isEditingInactive = computed<boolean>(() => editingRow.value !== null && !annealOccupies(editingRow.value.state))
+
+/** 时间窗依据壁厚：作废/挂起重试按作品当前壁厚，其余沿用记录快照（新建按当前壁厚） */
+const candidateBasis = computed<number>(() => {
+  if (isEditingInactive.value) return annealStore.wallThicknessOf(form.pieceId)
+  return editingRow.value?.basisWallThicknessMm ?? annealStore.wallThicknessOf(form.pieceId)
+})
+
 /** 当前表单的窑位冲突检测结果，冲突时禁用提交 */
 const conflict = computed(() =>
   annealStore.conflictOf({
@@ -69,12 +88,12 @@ const conflict = computed(() =>
     outAt: form.outAt,
     curveSeg: form.curveSeg,
     pieceId: form.pieceId,
+    basisWallThicknessMm: candidateBasis.value,
   })
 )
 
 const formDuration = computed(() => {
-  const piece = pieceStore.pieces.find((row) => row.id === form.pieceId)
-  const thickness = piece?.wallThicknessMm ?? 4
+  const thickness = candidateBasis.value
   return {
     segment: formatHours(segmentHours(form.curveSeg, thickness)),
     total: formatHours(totalAnnealHours(thickness)),
@@ -87,6 +106,8 @@ const stats = computed(() => ({
   waiting: annealStore.anneals.filter((row) => row.state === '待入窑').length,
   firing: annealStore.anneals.filter((row) => row.state === '退火中').length,
   done: annealStore.anneals.filter((row) => row.state === '已出炉').length,
+  voided: annealStore.anneals.filter((row) => row.state === '已作废').length,
+  suspended: annealStore.anneals.filter((row) => row.state === '已挂起').length,
 }))
 
 onMounted(() => {
@@ -175,6 +196,20 @@ async function handleAdvance(row: Anneal): Promise<void> {
   ElMessage.success(annealStore.lastMessage)
 }
 
+/** 重排作废 / 挂起记录：从排产这侧重试，已排不重复占位，撞窗则继续挂起 */
+async function handleReschedule(row: Anneal): Promise<void> {
+  const result = await annealStore.rescheduleAnneal(row.id)
+  if (result === 'skipped') {
+    ElMessage.info('该记录在排中，无需重排')
+    return
+  }
+  if (result === 'suspended') {
+    ElMessage.warning(annealStore.lastMessage)
+    return
+  }
+  ElMessage.success(annealStore.lastMessage)
+}
+
 function handleFilterChange(key: string, value: string): void {
   if (key === 'state') annealStore.setFilters({ state: value as AnnealState | 'all' })
   if (key === 'curveSeg') annealStore.setFilters({ curveSeg: value as CurveSeg | 'all' })
@@ -189,6 +224,8 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="待入窑" :value="stats.waiting" suffix="条" tone="info" icon="DataLine" />
       <StatBadge label="退火中" :value="stats.firing" suffix="条" tone="warning" icon="TrendCharts" />
       <StatBadge label="已出炉" :value="stats.done" suffix="条" tone="success" icon="PieChart" />
+      <StatBadge label="已作废" :value="stats.voided" suffix="条" tone="danger" icon="Warning" />
+      <StatBadge label="已挂起" :value="stats.suspended" suffix="条" tone="warning" icon="Clock" />
       <StatBadge
         label="窑位占用率"
         :value="`${annealStore.occupancyRate}%`"
@@ -246,16 +283,20 @@ function handleFilterChange(key: string, value: string): void {
       />
 
       <el-table v-else v-loading="!annealStore.ready" :data="annealStore.visibleAnneals" row-key="id" stripe>
-        <el-table-column label="作品" min-width="190">
+        <el-table-column label="作品" min-width="210">
           <template #default="{ row }">
             <div class="cell-stack">
               <el-link type="primary" @click="$router.push(`/pieces/${row.pieceId}/steps`)">
                 {{ pieceName[row.pieceId] ?? '（作品已删除）' }}
               </el-link>
               <span class="cell-sub">
-                壁厚 {{ annealStore.wallThicknessOf(row.pieceId) }} mm · 全流程
-                {{ annealStore.durationOf(row.pieceId).text }}
+                排位依据壁厚 {{ row.basisWallThicknessMm }} mm
+                <template v-if="annealStore.isBasisStale(row)">
+                  · 当前 {{ annealStore.wallThicknessOf(row.pieceId) }} mm
+                  <el-tag size="small" type="danger" effect="plain">依据已过期</el-tag>
+                </template>
               </span>
+              <span class="cell-sub">全流程 {{ annealStore.durationOf(row.pieceId).text }}</span>
             </div>
           </template>
         </el-table-column>
@@ -277,7 +318,7 @@ function handleFilterChange(key: string, value: string): void {
         </el-table-column>
         <el-table-column label="该段时长" width="120" align="right">
           <template #default="{ row }">
-            {{ formatHours(segmentHours(row.curveSeg, annealStore.wallThicknessOf(row.pieceId))) }}
+            {{ formatHours(segmentHours(row.curveSeg, annealStore.basisOf(row))) }}
           </template>
         </el-table-column>
         <el-table-column label="入窑时间" width="160">
@@ -289,21 +330,49 @@ function handleFilterChange(key: string, value: string): void {
             <span v-else>{{ row.outAt.replace('T', ' ') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="110">
+        <el-table-column label="状态 / 原因" width="200">
           <template #default="{ row }">
-            <el-tag
-              size="small"
-              :type="row.state === '已出炉' ? 'success' : row.state === '退火中' ? 'warning' : 'info'"
-              effect="dark"
-            >
-              {{ row.state }}
-            </el-tag>
+            <div class="cell-stack">
+              <el-tag
+                size="small"
+                effect="dark"
+                :type="
+                  row.state === '已出炉'
+                    ? 'success'
+                    : row.state === '退火中'
+                      ? 'warning'
+                      : row.state === '已作废'
+                        ? 'danger'
+                        : row.state === '已挂起'
+                          ? 'warning'
+                          : 'info'
+                "
+              >
+                {{ row.state }}
+              </el-tag>
+              <span v-if="row.voidReason !== ''" class="cell-sub cell-reason">{{ row.voidReason }}</span>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="230" fixed="right">
+        <el-table-column label="操作" width="260" fixed="right">
           <template #default="{ row }">
-            <el-button link type="primary" size="small" :disabled="row.state === '已出炉'" @click="handleAdvance(row)">
+            <el-button
+              link
+              type="primary"
+              size="small"
+              :disabled="row.state === '已出炉' || !annealOccupies(row.state)"
+              @click="handleAdvance(row)"
+            >
               推进状态
+            </el-button>
+            <el-button
+              v-if="!annealOccupies(row.state)"
+              link
+              type="warning"
+              size="small"
+              @click="handleReschedule(row)"
+            >
+              {{ row.state === '已挂起' ? '重试排产' : '重排' }}
             </el-button>
             <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" size="small" @click="handleDelete(row)">删除</el-button>
@@ -336,12 +405,22 @@ function handleFilterChange(key: string, value: string): void {
       </div>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editingId === null ? '分配退火窑位' : '编辑退火编排'" width="660px">
+    <el-dialog
+      v-model="dialogVisible"
+      :title="
+        editingId === null
+          ? '分配退火窑位'
+          : isEditingInactive
+            ? '重排退火记录（按当前壁厚重试）'
+            : '编辑退火编排'
+      "
+      width="660px"
+    >
       <el-form ref="formRef" :model="form" :rules="rules" label-width="120px">
         <el-row :gutter="12">
           <el-col :span="12">
             <el-form-item label="作品" prop="pieceId">
-              <el-select v-model="form.pieceId" filterable style="width: 100%">
+              <el-select v-model="form.pieceId" filterable style="width: 100%" :disabled="editingId !== null">
                 <el-option
                   v-for="item in pieceStore.pieces"
                   :key="item.id"
@@ -392,10 +471,20 @@ function handleFilterChange(key: string, value: string): void {
           </el-col>
         </el-row>
         <el-form-item label="退火状态" prop="state">
-          <el-select v-model="form.state" style="width: 100%">
-            <el-option v-for="item in ANNEAL_STATE_OPTIONS" :key="item" :value="item" :label="item" />
+          <el-select v-model="form.state" style="width: 100%" :disabled="isEditingInactive">
+            <el-option v-for="item in ANNEAL_STATE_FLOW" :key="item" :value="item" :label="item" />
           </el-select>
         </el-form-item>
+
+        <el-alert
+          v-if="isEditingInactive"
+          type="warning"
+          show-icon
+          :closable="false"
+          class="mb-14"
+          title="作废 / 挂起记录按「重试」处理"
+          :description="`保存后将按作品当前壁厚 ${annealStore.wallThicknessOf(form.pieceId)} mm 重新校验时间窗：通过即恢复为「待入窑」，仍冲突则保持「已挂起」，不会改动其他已占记录。`"
+        />
 
         <el-alert
           v-if="conflict.conflict"
@@ -411,7 +500,7 @@ function handleFilterChange(key: string, value: string): void {
           show-icon
           :closable="false"
           title="窑位可用，可以提交"
-          :description="`当前曲线段「${form.curveSeg}」理论时长 ${formDuration.segment}，该作品全流程退火 ${formDuration.total}。${formDuration.hint}`"
+          :description="`当前曲线段「${form.curveSeg}」依据壁厚 ${candidateBasis} mm，理论时长 ${formDuration.segment}，该作品全流程退火 ${formDuration.total}。${formDuration.hint}`"
         />
       </el-form>
       <template #footer>
@@ -455,6 +544,11 @@ function handleFilterChange(key: string, value: string): void {
 .cell-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.cell-reason {
+  color: #c0392b;
+  line-height: 1.5;
 }
 
 .slot-grid {
