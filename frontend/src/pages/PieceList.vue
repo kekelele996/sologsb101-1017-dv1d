@@ -13,12 +13,14 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useAnnealStore } from '@/stores/annealStore'
 import { CRAFT_OPTIONS, PIECE_STATE_OPTIONS, type Craft, type Piece, type PieceDraft, type PieceState } from '@/types/piece'
 import { checkDesign } from '@/utils/thermal'
 
 const router = useRouter()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const annealStore = useAnnealStore()
 
 const dialogVisible = ref(false)
 const submitting = ref(false)
@@ -56,6 +58,15 @@ const batchLabel = computed<Record<string, string>>(() => {
 
 const designCheck = computed(() => checkDesign(form.designHeightMm, form.wallThicknessMm))
 
+const wallChangeWillVoidAnneals = computed<number>(() => {
+  if (editingId.value === null) return 0
+  const original = pieceStore.pieces.find((row) => row.id === editingId.value)
+  if (original === undefined || original.wallThicknessMm === form.wallThicknessMm) return 0
+  return annealStore.anneals.filter(
+    (row) => row.pieceId === editingId.value && row.state !== '已作废',
+  ).length
+})
+
 const stats = computed(() => ({
   total: pieceStore.pieces.length,
   designing: pieceStore.pieces.filter((row) => row.state === '设计中').length,
@@ -71,6 +82,7 @@ const stats = computed(() => ({
 onMounted(() => {
   void pieceStore.loadAll()
   void furnaceStore.loadAll()
+  void annealStore.loadAll()
 })
 
 function openCreate(): void {
@@ -116,6 +128,18 @@ async function handleSubmit(): Promise<void> {
       dialogVisible.value = false
       void router.push(`/pieces/${row.id}/steps`)
       return
+    }
+    if (wallChangeWillVoidAnneals.value > 0) {
+      try {
+        await ElMessageBox.confirm(
+          `壁厚改动后，该作品现有 ${wallChangeWillVoidAnneals.value} 条未作废退火记录将全部作废并保留，需要由排产员按新壁厚重排。确认继续？`,
+          '壁厚改动将作废旧退火记录',
+          { type: 'warning', confirmButtonText: '作废旧记录并保存', cancelButtonText: '取消' },
+        )
+      } catch {
+        submitting.value = false
+        return
+      }
     }
     await pieceStore.updatePiece(editingId.value, { ...form })
     ElMessage.success('作品信息已更新')
@@ -308,11 +332,20 @@ function handleFilterChange(key: string, value: string): void {
           </el-col>
         </el-row>
         <el-alert
+          v-if="wallChangeWillVoidAnneals > 0"
+          type="warning"
+          show-icon
+          :closable="false"
+          :title="`壁厚改动将作废 ${wallChangeWillVoidAnneals} 条已排退火记录`"
+          description="旧退火记录和吹制工序都会保留；作废记录不再占窑位，需由排产员在退火页按新壁厚重排。"
+          class="mb-14"
+        />
+        <el-alert
           :type="designCheck.ok ? 'success' : 'warning'"
           show-icon
           :closable="false"
           :title="designCheck.message"
-          description="壁厚会直接决定退火时长：升温与缓冷按温差/速率换算，保温按每 5 mm 壁厚 1.2 小时换算。"
+          description="壁厚会直接决定退火时长：退火记录保存排位时的壁厚快照；排位后再改壁厚，原退火记录会作废等待重排。"
         />
       </el-form>
       <template #footer>

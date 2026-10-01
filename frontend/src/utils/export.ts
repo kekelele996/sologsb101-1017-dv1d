@@ -9,6 +9,7 @@ import type { GlassBatch } from '../types/batch'
 import type { Piece } from '../types/piece'
 import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
+import { isAnnealOccupying } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { stampSuffix } from './id'
 import { formatHours, isLowRemain, segmentHours, totalAnnealHours } from './thermal'
@@ -110,7 +111,13 @@ export function buildScheduleCsv(
     const furnace = furnaces.find((row) => row.id === batch?.furnaceId)
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
-    const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
+    const activePieceAnneals = pieceAnneals.filter((row) => isAnnealOccupying(row.state))
+    const latestAnneal =
+      activePieceAnneals.length > 0
+        ? activePieceAnneals[activePieceAnneals.length - 1]
+        : pieceAnneals.length > 0
+          ? pieceAnneals[pieceAnneals.length - 1]
+          : null
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
     lines.push(
@@ -200,7 +207,11 @@ export function buildStepCardText(
   if (anneals.length > 0) {
     lines.push('退火：')
     anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
+      lines.push(
+        `  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state} · 依据壁厚 ${row.basisWallThicknessMm} mm${
+          row.lifecycleNote === '' ? '' : ` · ${row.lifecycleNote}`
+        }`,
+      )
     })
   }
   return lines.join('\n')

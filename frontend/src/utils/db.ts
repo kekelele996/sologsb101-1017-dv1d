@@ -1,7 +1,7 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
  * - 数据库名：gbglassblow
- * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引并回填默认值
+ * - 含数据结构版本号与升级迁移逻辑；v1 → v2 为 Piece 增加 craft 索引；v3 为 Anneal 增加排位壁厚快照与生命周期
  * - 提供各表增删改查、作品状态联动、整库快照导入导出与重置
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
@@ -10,7 +10,8 @@ import type { Furnace } from '../types/furnace'
 import type { GlassBatch } from '../types/batch'
 import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
-import type { Anneal } from '../types/anneal'
+import type { Anneal, AnnealState } from '../types/anneal'
+import { ANNEAL_STATE_OPTIONS, VOID_ANNEAL_STATE, isAnnealOccupying } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
@@ -19,10 +20,10 @@ import { seedDatabase } from './seed'
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -91,6 +92,39 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：退火记录保存排位依据尺寸，并支持挂起 / 作废生命周期 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+      })
+      .upgrade(async (tx) => {
+        const pieceSizeById = new Map<string, { wallThicknessMm: number; designHeightMm: number }>()
+        await tx.table('pieces').each((row: Record<string, unknown>) => {
+          pieceSizeById.set(String(row.id), {
+            wallThicknessMm: typeof row.wallThicknessMm === 'number' ? row.wallThicknessMm : 4,
+            designHeightMm: typeof row.designHeightMm === 'number' ? row.designHeightMm : 0,
+          })
+        })
+        await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
+          const size = pieceSizeById.get(String(row.pieceId))
+          if (typeof row.basisWallThicknessMm !== 'number') {
+            row.basisWallThicknessMm = size?.wallThicknessMm ?? 4
+          }
+          if (typeof row.basisDesignHeightMm !== 'number') {
+            row.basisDesignHeightMm = size?.designHeightMm ?? 0
+          }
+          if (typeof row.lifecycleNote !== 'string') row.lifecycleNote = ''
+          if (!ANNEAL_STATE_OPTIONS.includes(row.state as AnnealState)) {
+            row.state = '待入窑'
+          }
         })
       })
   }
@@ -170,7 +204,20 @@ export async function listPieces(): Promise<Piece[]> {
 }
 
 export async function putPiece(row: Piece): Promise<void> {
-  await db.pieces.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+  await db.transaction('rw', db.pieces, db.anneals, db.steps, db.inspects, async () => {
+    const previous = await db.pieces.get(row.id)
+    await db.pieces.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
+    if (previous !== undefined && previous.wallThicknessMm !== row.wallThicknessMm) {
+      await db.anneals.where('pieceId').equals(row.id).modify((anneal) => {
+        if (anneal.state === VOID_ANNEAL_STATE) return
+        anneal.state = VOID_ANNEAL_STATE
+        anneal.outAt = ''
+        anneal.lifecycleNote = `排位依据壁厚 ${anneal.basisWallThicknessMm ?? previous.wallThicknessMm} mm 已改为 ${row.wallThicknessMm} mm，原退火记录作废，等待按新壁厚重排。`
+        anneal.updatedAt = nowIso()
+      })
+    }
+  })
+  await syncPieceState(row.id)
 }
 
 /** 删除作品：级联清理工序、退火与检验记录 */
@@ -185,7 +232,7 @@ export async function removePiece(id: string): Promise<void> {
 
 /**
  * 依工序与退火、检验记录推导并回写作品状态。
- * 规则：有检验记录 → 已检验；有已出炉退火 → 已退火；有工序记录 → 制作中；否则设计中。
+ * 规则：有检验记录且有有效退火 → 已检验；有有效已出炉退火 → 已退火；有工序记录 → 制作中；否则设计中。
  */
 export async function syncPieceState(pieceId: string): Promise<PieceState | null> {
   const piece = await db.pieces.get(pieceId)
@@ -198,8 +245,9 @@ export async function syncPieceState(pieceId: string): Promise<PieceState | null
 
   let next: PieceState = '设计中'
   if (steps.length > 0) next = '制作中'
-  if (anneals.some((row) => row.state === '已出炉')) next = '已退火'
-  if (inspects.length > 0) next = '已检验'
+  const hasOccupyingAnneal = anneals.some((row) => isAnnealOccupying(row.state))
+  if (anneals.some((row) => isAnnealOccupying(row.state) && row.state === '已出炉')) next = '已退火'
+  if (inspects.length > 0 && hasOccupyingAnneal) next = '已检验'
 
   if (next !== piece.state) {
     await db.pieces.update(pieceId, { state: next, updatedAt: nowIso() })
@@ -256,6 +304,27 @@ export async function putAnneal(row: Anneal): Promise<void> {
   await syncPieceState(row.pieceId)
 }
 
+/** 规范化旧版 / 外部存档中的退火记录，补齐排位依据尺寸与生命周期字段 */
+function normalizeAnneal(row: Anneal, pieceSizeOf: (pieceId: string) => Piece | undefined): Anneal {
+  const piece = pieceSizeOf(row.pieceId)
+  const state = ANNEAL_STATE_OPTIONS.includes(row.state) ? row.state : '待入窑'
+  return {
+    ...row,
+    state,
+    basisWallThicknessMm:
+      typeof row.basisWallThicknessMm === 'number' && row.basisWallThicknessMm > 0
+        ? row.basisWallThicknessMm
+        : piece?.wallThicknessMm ?? 4,
+    basisDesignHeightMm:
+      typeof row.basisDesignHeightMm === 'number' && row.basisDesignHeightMm > 0
+        ? row.basisDesignHeightMm
+        : piece?.designHeightMm ?? 0,
+    lifecycleNote: typeof row.lifecycleNote === 'string' ? row.lifecycleNote : '',
+    updatedAt: nowIso(),
+    revision: ROW_REVISION,
+  }
+}
+
 export async function removeAnneal(id: string): Promise<void> {
   const row = await db.anneals.get(id)
   if (!row) return
@@ -266,7 +335,7 @@ export async function removeAnneal(id: string): Promise<void> {
 /** 推进退火状态；「已出炉」时写回出炉时间并同步作品状态 */
 export async function advanceAnnealState(annealId: string, next: Anneal['state'], outAt: string): Promise<void> {
   const row = await db.anneals.get(annealId)
-  if (!row) return
+  if (!row || !isAnnealOccupying(row.state)) return
   await db.anneals.update(annealId, { state: next, outAt: next === '已出炉' ? outAt : row.outAt, updatedAt: nowIso() })
   await syncPieceState(row.pieceId)
 }
@@ -335,7 +404,10 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
+    const pieceById = new Map(snapshot.pieces.map((row) => [row.id, row]))
+    await db.anneals.bulkPut(
+      snapshot.anneals.map((row) => normalizeAnneal(row, (pieceId) => pieceById.get(pieceId))),
+    )
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })
 }

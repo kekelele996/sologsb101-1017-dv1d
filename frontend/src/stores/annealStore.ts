@@ -6,7 +6,7 @@ import { computed, reactive, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { liveQuery } from 'dexie'
 import type { Anneal, AnnealDraft, AnnealState, CurveSeg } from '../types/anneal'
-import { ANNEAL_STATE_FLOW } from '../types/anneal'
+import { ANNEAL_STATE_FLOW, HELD_ANNEAL_STATE, VOID_ANNEAL_STATE, isAnnealOccupying } from '../types/anneal'
 import type { Piece } from '../types/piece'
 import {
   ROW_REVISION,
@@ -41,6 +41,9 @@ export interface SlotOccupancy {
   pieceId: string
   pieceName: string
   curveSeg: CurveSeg
+  basisWallThicknessMm: number
+  basisDesignHeightMm: number
+  lifecycleNote: string
   inAt: string
   outAt: string
   state: AnnealState
@@ -80,9 +83,10 @@ export const useAnnealStore = defineStore('anneal', () => {
     return codes.flatMap((code) => kilnSlots(code))
   })
 
-  /** 窑位占用表 */
+  /** 窑位占用表：只展示有效占位；挂起 / 作废记录保留在记录列表，不进入占用表 */
   const occupancy = computed<SlotOccupancy[]>(() =>
     anneals.value
+      .filter((row) => isAnnealOccupying(row.state))
       .map((row) => {
         const piece = pieces.value.find((item) => item.id === row.pieceId)
         return {
@@ -91,6 +95,9 @@ export const useAnnealStore = defineStore('anneal', () => {
           pieceId: row.pieceId,
           pieceName: piece?.name ?? '（作品已删除）',
           curveSeg: row.curveSeg,
+          basisWallThicknessMm: row.basisWallThicknessMm,
+          basisDesignHeightMm: row.basisDesignHeightMm,
+          lifecycleNote: row.lifecycleNote,
           inAt: row.inAt,
           outAt: row.outAt,
           state: row.state,
@@ -124,9 +131,43 @@ export const useAnnealStore = defineStore('anneal', () => {
 
   /** 某件作品的窑位冲突检测（编辑时排除自身） */
   function conflictOf(
-    candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+    candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId' | 'state' | 'basisWallThicknessMm'>,
   ): SlotConflict {
     return checkSlotConflict(anneals.value, candidate, wallThicknessOf, candidate.id)
+  }
+
+  /** 会阻止新建排位的同作品记录：待入窑 / 退火中 / 已挂起；历史已出炉与已作废不阻止返工后再排 */
+  function existingPlanOf(pieceId: string, excludeAnnealId = ''): Anneal | undefined {
+    return anneals.value.find(
+      (row) =>
+        row.pieceId === pieceId &&
+        row.id !== excludeAnnealId &&
+        (row.state === HELD_ANNEAL_STATE ||
+          (isAnnealOccupying(row.state) && row.state !== '已出炉')),
+    )
+  }
+
+  /** 已有效占位的同作品记录；已作废 / 已挂起不阻止挂起记录重试成功 */
+  function activeAnnealOf(pieceId: string, excludeAnnealId = ''): Anneal | undefined {
+    return anneals.value.find(
+      (row) =>
+        row.pieceId === pieceId &&
+        row.id !== excludeAnnealId &&
+        isAnnealOccupying(row.state),
+    )
+  }
+
+  /** 某条退火记录排位时记录的壁厚；作品壁厚可能已在之后调整 */
+  function basisThicknessOf(annealId: string): number {
+    return anneals.value.find((row) => row.id === annealId)?.basisWallThicknessMm ?? 4
+  }
+
+  /** 某条退火记录的理论时长；始终按排位时保存的依据壁厚计算 */
+  function durationOfAnneal(annealId: string): { hours: number; text: string } {
+    const row = anneals.value.find((item) => item.id === annealId)
+    const thickness = row?.basisWallThicknessMm ?? 4
+    const hours = segmentHours(row?.curveSeg ?? '缓冷', thickness)
+    return { hours, text: formatHours(hours) }
   }
 
   /** 某件作品的退火时长汇总 */
@@ -175,6 +216,15 @@ export const useAnnealStore = defineStore('anneal', () => {
   }
 
   async function createAnneal(draft: AnnealDraft): Promise<Anneal | null> {
+    const duplicate = existingPlanOf(draft.pieceId)
+    if (duplicate !== undefined) {
+      lastMessage.value =
+        duplicate.state === HELD_ANNEAL_STATE
+          ? `该作品已有一条挂起重排，请在挂起记录上重试，不重复生成排位。`
+          : `该作品已有有效退火记录（${duplicate.kilnSlot} · ${duplicate.state}），不会重复占位；请重排或编辑既有记录。`
+      return null
+    }
+    const stamp = nowIso()
     const conflict = conflictOf({
       id: '',
       kilnSlot: draft.kilnSlot,
@@ -182,12 +232,9 @@ export const useAnnealStore = defineStore('anneal', () => {
       outAt: draft.outAt,
       curveSeg: draft.curveSeg,
       pieceId: draft.pieceId,
+      state: draft.state,
+      basisWallThicknessMm: draft.basisWallThicknessMm,
     })
-    if (conflict.conflict) {
-      lastMessage.value = conflict.message
-      return null
-    }
-    const stamp = nowIso()
     const row: Anneal = {
       id: uuid('anneal'),
       pieceId: draft.pieceId,
@@ -195,43 +242,77 @@ export const useAnnealStore = defineStore('anneal', () => {
       curveSeg: draft.curveSeg,
       inAt: draft.inAt,
       outAt: draft.outAt,
-      state: draft.state,
+      state: conflict.conflict ? HELD_ANNEAL_STATE : draft.state,
+      basisWallThicknessMm: draft.basisWallThicknessMm,
+      basisDesignHeightMm: draft.basisDesignHeightMm,
+      lifecycleNote: conflict.conflict
+        ? `重排时间窗撞窑位，已挂起等待人工确认；未占用 ${draft.kilnSlot}。${conflict.message}`
+        : '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
     }
     await putAnneal(row)
     revision.value += 1
-    lastMessage.value = `已分配窑位 ${row.kilnSlot}，理论时长 ${formatHours(segmentHours(row.curveSeg, wallThicknessOf(row.pieceId)))}`
+    if (conflict.conflict) {
+      lastMessage.value = `时间窗冲突，已挂起本次重排；既有窑位记录保持不变。${conflict.message}`
+    } else {
+      lastMessage.value = `已分配窑位 ${row.kilnSlot}，依据壁厚 ${row.basisWallThicknessMm} mm，该段理论时长 ${formatHours(segmentHours(row.curveSeg, row.basisWallThicknessMm))}`
+    }
     return row
   }
 
   async function updateAnneal(annealId: string, draft: AnnealDraft): Promise<boolean> {
-    const conflict = conflictOf({
+    const existing = anneals.value.find((row) => row.id === annealId)
+    if (existing === undefined) return false
+    if (existing.state === VOID_ANNEAL_STATE) {
+      lastMessage.value = '该退火记录已因壁厚变更作废，不能覆盖；请按新壁厚重排。'
+      return false
+    }
+
+    const candidate = {
       id: annealId,
       kilnSlot: draft.kilnSlot,
       inAt: draft.inAt,
       outAt: draft.outAt,
       curveSeg: draft.curveSeg,
       pieceId: draft.pieceId,
-    })
-    if (conflict.conflict) {
-      lastMessage.value = conflict.message
+      state: draft.state,
+      basisWallThicknessMm: draft.basisWallThicknessMm,
+    }
+    const duplicate = activeAnnealOf(draft.pieceId, annealId)
+    if (duplicate !== undefined) {
+      lastMessage.value = `该作品已有其他有效退火记录（${duplicate.kilnSlot} · ${duplicate.state}），不能重复占位。`
       return false
     }
-    const existing = anneals.value.find((row) => row.id === annealId)
-    if (existing === undefined) return false
+    const conflict = conflictOf(candidate)
+    if (conflict.conflict) {
+      if (existing.state !== HELD_ANNEAL_STATE) {
+        lastMessage.value = `调整会撞时间窗，已保留原记录不变；可先挂起重排等待人工确认。${conflict.message}`
+        return false
+      }
+      await putAnneal({
+        ...existing,
+        ...draft,
+        state: HELD_ANNEAL_STATE,
+        basisWallThicknessMm: draft.basisWallThicknessMm,
+        basisDesignHeightMm: draft.basisDesignHeightMm,
+        lifecycleNote: `重排时间窗撞窑位，已挂起等待人工确认；未占用 ${draft.kilnSlot}。${conflict.message}`,
+      })
+      revision.value += 1
+      lastMessage.value = '仍与已占时间窗冲突，挂起记录已更新；既有占位记录未改动。'
+      return true
+    }
+
     await putAnneal({
       ...existing,
-      pieceId: draft.pieceId,
-      kilnSlot: draft.kilnSlot,
-      curveSeg: draft.curveSeg,
-      inAt: draft.inAt,
-      outAt: draft.outAt,
-      state: draft.state,
+      ...draft,
+      basisWallThicknessMm: draft.basisWallThicknessMm,
+      basisDesignHeightMm: draft.basisDesignHeightMm,
+      lifecycleNote: '',
     })
     revision.value += 1
-    lastMessage.value = '退火编排已更新'
+    lastMessage.value = '退火编排已更新，未改动吹制工序记录'
     return true
   }
 
@@ -246,7 +327,10 @@ export const useAnnealStore = defineStore('anneal', () => {
     const existing = anneals.value.find((row) => row.id === annealId)
     if (existing === undefined) return null
     const index = ANNEAL_STATE_FLOW.indexOf(existing.state)
-    if (index < 0 || index >= ANNEAL_STATE_FLOW.length - 1) return null
+    if (index < 0 || index >= ANNEAL_STATE_FLOW.length - 1) {
+      lastMessage.value = '已挂起或已作废的退火记录不能推进；请重排挂起记录，作废记录需新建排位。'
+      return null
+    }
     const next = ANNEAL_STATE_FLOW[index + 1]
     await advanceAnnealState(annealId, next, nowLocalInput())
     revision.value += 1
@@ -271,6 +355,10 @@ export const useAnnealStore = defineStore('anneal', () => {
     occupancyRate,
     visibleAnneals,
     wallThicknessOf,
+    existingPlanOf,
+    activeAnnealOf,
+    basisThicknessOf,
+    durationOfAnneal,
     conflictOf,
     durationOf,
     loadAll,

@@ -6,6 +6,7 @@
  * - 工艺温度区间与设计尺寸校验
  */
 import type { Anneal, CurveSeg } from '../types/anneal'
+import { isAnnealOccupying } from '../types/anneal'
 import type { Craft } from '../types/piece'
 
 /** 保留 1 位小数 */
@@ -107,13 +108,16 @@ export function parseAt(value: string): number {
   return Number.isNaN(stamp) ? Number.NaN : stamp
 }
 
-/** 时间窗：[入窑, 出炉]；未出炉时以入窑 + 预计时长作为临时出炉时间 */
-export function annealWindow(row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg'>, wallThicknessMm: number): [number, number] {
+/** 时间窗：[入窑, 出炉]；未出炉时以入窑 + 排位依据壁厚推算的完整退火时长作为临时出炉时间 */
+export function annealWindow(
+  row: Pick<Anneal, 'inAt' | 'outAt' | 'curveSeg' | 'basisWallThicknessMm'>,
+  wallThicknessMm: number = row.basisWallThicknessMm,
+): [number, number] {
   const start = parseAt(row.inAt)
   if (Number.isNaN(start)) return [Number.NaN, Number.NaN]
   const end = parseAt(row.outAt)
   if (!Number.isNaN(end) && end > start) return [start, end]
-  return [start, start + segmentHours(row.curveSeg, wallThicknessMm) * 3600 * 1000]
+  return [start, start + totalAnnealHours(wallThicknessMm) * 3600 * 1000]
 }
 
 /** 两个时间窗是否重叠 */
@@ -136,23 +140,31 @@ export interface SlotConflict {
  */
 export function checkSlotConflict(
   existing: Anneal[],
-  candidate: Pick<Anneal, 'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId'>,
+  candidate: Pick<
+    Anneal,
+    'id' | 'kilnSlot' | 'inAt' | 'outAt' | 'curveSeg' | 'pieceId' | 'state' | 'basisWallThicknessMm'
+  >,
   wallThicknessOf: (pieceId: string) => number,
   excludeAnnealId = '',
 ): SlotConflict {
-  const ownThickness = wallThicknessOf(candidate.pieceId)
+  if (!isAnnealOccupying(candidate.state)) {
+    return { conflict: false, withPieceId: '', withAnnealId: '', message: '' }
+  }
+  const ownThickness = candidate.basisWallThicknessMm || wallThicknessOf(candidate.pieceId)
   const ownWindow = annealWindow(candidate, ownThickness)
 
   for (const row of existing) {
     if (row.id === excludeAnnealId) continue
+    if (!isAnnealOccupying(row.state)) continue
     if (row.kilnSlot !== candidate.kilnSlot) continue
-    const otherWindow = annealWindow(row, wallThicknessOf(row.pieceId))
+    const otherThickness = row.basisWallThicknessMm || wallThicknessOf(row.pieceId)
+    const otherWindow = annealWindow(row, otherThickness)
     if (windowsOverlap(ownWindow, otherWindow)) {
       return {
         conflict: true,
         withPieceId: row.pieceId,
         withAnnealId: row.id,
-        message: `窑位 ${candidate.kilnSlot} 在该时间窗内已被占用（${row.inAt} 起的 ${row.curveSeg} 段），请更换窑位或调整时间。`,
+        message: `窑位 ${candidate.kilnSlot} 在该时间窗内已被占用（${row.inAt} 起的 ${row.curveSeg} 段），可将本次重排挂起，等待人工调整。`,
       }
     }
   }

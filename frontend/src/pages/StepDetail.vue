@@ -13,6 +13,7 @@ import StageTag from '@/components/common/StageTag.vue'
 import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
+import { useAnnealStore } from '@/stores/annealStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
 import { buildStepCardText, copyText } from '@/utils/export'
 import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
@@ -21,6 +22,7 @@ const route = useRoute()
 const router = useRouter()
 const pieceStore = usePieceStore()
 const furnaceStore = useFurnaceStore()
+const annealStore = useAnnealStore()
 
 const pieceId = computed<string>(() => String(route.params.id ?? ''))
 const piece = computed(() => pieceStore.pieces.find((row) => row.id === pieceId.value) ?? null)
@@ -69,10 +71,17 @@ const tempCheck = computed(() =>
 )
 
 const currentStep = computed<Step | null>(() => steps.value.find((row) => row.state !== '已完成') ?? null)
+const voidedAnneals = computed(() =>
+  annealStore.anneals.filter((row) => row.pieceId === pieceId.value && row.state === '已作废'),
+)
+const heldAnneals = computed(() =>
+  annealStore.anneals.filter((row) => row.pieceId === pieceId.value && row.state === '已挂起'),
+)
 
 onMounted(() => {
   void furnaceStore.loadAll()
   void pieceStore.loadAll()
+  void annealStore.loadAll()
 })
 
 function openCreate(): void {
@@ -237,6 +246,25 @@ function goAnnealing(): void {
         class="mb-14"
         title="全部工序已完成，可以进入退火排位"
         :description="`理论退火时长 ${formatHours(totalAnnealHours(piece?.wallThicknessMm ?? 4))}（升温 / 保温 / 缓冷三段合计）。`"
+      />
+
+      <el-alert
+        v-if="voidedAnneals.length > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`壁厚已变更，${voidedAnneals.length} 条退火记录已作废等待排产员重排`"
+        description="操作工保存温度、时长、操作人和工序推进时不会改动窑位、曲线段、入窑/出炉时间；作废退火记录会完整保留用于追溯。"
+      />
+      <el-alert
+        v-else-if="heldAnneals.length > 0"
+        type="info"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        title="该作品有挂起的退火重排，等待排产员确认窑位或时间"
+        description="挂起记录不占用窑位，已占记录保持不变；工序记录可继续由操作工维护。"
       />
 
       <el-card shadow="never">
